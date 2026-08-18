@@ -723,52 +723,188 @@ def analyze_one(client,sym,capital,risk):
                  'shares':sh,'position_value':pv,'risk_value':rv})
     return base
 
-def scan_core(client,capital,risk,workers=1,symbols=None):
-    symbols=symbols or SYMBOLS; raw=[];errors=[];started=datetime.now(timezone.utc)
-    if workers>1:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            fs={ex.submit(analyze_one,client,s,capital,risk):s for s in symbols}
-            for f in as_completed(fs):
-                sym=fs[f]
-                try:raw.append(f.result())
-                except Exception as exc:errors.append((sym,type(exc).__name__,str(exc)[:160]))
-    else:
-        for s in symbols:
-            try:raw.append(analyze_one(client,s,capital,risk))
-            except Exception as exc:errors.append((s,type(exc).__name__,str(exc)[:160]))
+def batch_history(symbols, timeout=20, years=5):
+    """Fetch all EGX daily candles in one Yahoo multi-ticker request.
+    This is the main speed path: technical analysis is local after the batch download.
+    """
+    tickers=[f'{sym}.CA' for sym in symbols]
+    try:
+        data=yf.download(
+            tickers=tickers,
+            period=f'{int(years)}y', interval='1d',
+            auto_adjust=False, actions=True,
+            group_by='ticker', threads=True, progress=False,
+            timeout=timeout, repair=True
+        )
+        return data, '', 'success'
+    except TypeError:
+        try:
+            data=yf.download(
+                tickers=tickers, period=f'{int(years)}y', interval='1d',
+                auto_adjust=False, actions=True,
+                group_by='ticker', threads=True, progress=False,
+                timeout=timeout
+            )
+            return data, 'repair_unsupported', 'success'
+        except Exception as exc:
+            return pd.DataFrame(), '', f'{type(exc).__name__}: {str(exc)[:220]}'
+    except Exception as exc:
+        return pd.DataFrame(), '', f'{type(exc).__name__}: {str(exc)[:220]}'
+
+
+def extract_batch_symbol(data, sym, symbols):
+    if data is None or getattr(data, 'empty', True):
+        return pd.DataFrame()
+    key=f'{sym}.CA'
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            lvl0=set(str(x) for x in data.columns.get_level_values(0))
+            lvl1=set(str(x) for x in data.columns.get_level_values(1))
+            if key in lvl0:
+                d=data[key].copy()
+            elif key in lvl1:
+                d=data.xs(key, axis=1, level=1).copy()
+            elif sym in lvl0:
+                d=data[sym].copy()
+            elif sym in lvl1:
+                d=data.xs(sym, axis=1, level=1).copy()
+            else:
+                return pd.DataFrame()
+        else:
+            # Single-symbol fallback.
+            d=data.copy()
+        return clean(d)
+    except Exception:
+        return pd.DataFrame()
+
+
+def fast_technical_scan(symbols, capital, risk, batch_data, repair_status='success'):
+    rows=[]; errors=[]
+    for sym in symbols:
+        try:
+            d=extract_batch_symbol(batch_data, sym, symbols)
+            hq=history_quality(d, repair_status) if not d.empty else 0.0
+            gaps=trading_gap_stats(d)
+            split_actions=d[['Stock Splits']].copy() if (not d.empty and 'Stock Splits' in d.columns) else pd.DataFrame()
+            if split_actions.empty:
+                split_actions=None
+            base={'symbol':sym,'history_ok':not d.empty,'history_quality':hq,
+                  'history_sufficiency':history_sufficiency(d),'price_last_date':d.index[-1] if not d.empty else None,
+                  'repair_status':repair_status,'history_error':'' if not d.empty else 'No batch history returned',
+                  'actions_status':'embedded_in_history' if split_actions is not None else 'not_available',
+                  'actions_error':'','technical_data_sufficient':False,
+                  'expected_sessions':gaps['expected_sessions'],'observed_sessions':gaps['observed_sessions'],
+                  'missing_sessions':gaps['missing_sessions'],'gap_ratio':gaps['gap_ratio']}
+            if d.empty:
+                rows.append(base); continue
+            di=add_ind(d); w,m=completed_tf(d); tech=technical(di,w,m)
+            base.update({'price':float(di.Close.iloc[-1]),
+                         'total_return_cagr':total_return_cagr(d),
+                         'price_cagr':price_cagr(d,split_actions)})
+            if tech is None:
+                base['technical_data_sufficiency_reason']='daily>=220, completed_weekly>=60, completed_monthly>=24'
+            else:
+                low,high,stop,tps=setup(di); entry=(low+high)/2
+                sh,pv,rv=position(capital,risk,entry,stop)
+                base.update({'technical_data_sufficient':True,'technical_score':tech[0],
+                    'breakout':tech[1],'rr':tech[2],'next_resistance':tech[3],
+                    'entry_low':low,'entry_high':high,'stop':stop,
+                    'tp1':tps[0][0],'tp1_source':tps[0][1],'tp2':tps[1][0],'tp2_source':tps[1][1],
+                    'tp3':tps[2][0],'tp3_source':tps[2][1],
+                    'shares':sh,'position_value':pv,'risk_value':rv})
+            rows.append(base)
+        except Exception as exc:
+            errors.append((sym,type(exc).__name__,str(exc)[:160]))
+    return rows,errors
+
+
+def scan_core(client, capital, risk, workers=1, symbols=None, fundamentals_limit=10, years=5):
+    """FAST DATA mode: batch candles for the whole universe, then fundamentals only for
+    the best technical candidates. This avoids 2-3 Yahoo requests per stock.
+    """
+    symbols=symbols or SYMBOLS
+    started=datetime.now(timezone.utc); errors=[]
+    batch_data, batch_status, batch_error=batch_history(symbols, timeout=getattr(client,'timeout',20), years=years)
+    if batch_error:
+        errors.append(('BATCH','history',batch_error))
+        return pd.DataFrame(),errors,{'universe_size':len(symbols),'batch_history_ok':False,'batch_history_error':batch_error}
+
+    raw,tech_errors=fast_technical_scan(symbols,capital,risk,batch_data,batch_status or 'success')
+    errors.extend(tech_errors)
+    tech_rows=[r for r in raw if 'technical_score' in r]
+    tech_rank=sorted(tech_rows,key=lambda r:(r.get('technical_score',-1),r.get('rr',0),r.get('history_quality',0)),reverse=True)
+    fund_symbols=[r['symbol'] for r in tech_rank[:max(1,int(fundamentals_limit))]]
+
+    # Fundamentals are intentionally limited to the strongest technical candidates.
+    mgr=client
+    def fund_one(sym):
+        try:
+            t=mgr.ticker(sym); f=fundamentals(mgr,t); return sym,f,None
+        except Exception as exc:
+            return sym,{},f'{type(exc).__name__}: {str(exc)[:220]}'
+    if fund_symbols:
+        with ThreadPoolExecutor(max_workers=max(1,min(int(workers),len(fund_symbols)))) as ex:
+            futs=[ex.submit(fund_one,s) for s in fund_symbols]
+            for fut in as_completed(futs):
+                sym,f,err=fut.result()
+                for r in raw:
+                    if r.get('symbol')==sym:
+                        r.update(f)
+                        r['fundamentals_requested']=True
+                        r['fundamentals_ok']=bool(f.get('fundamentals_ok'))
+                        if err:
+                            r['info_error']=err; r['income_error']=err
+                        break
     for r in raw:
+        if 'fundamentals_requested' not in r:
+            r.update({'sector':'Not analyzed','industry':'Not analyzed','sector_class':'Unknown',
+                      'fundamentals_ok':False,'fundamentals_quality':0.0,'fundamentals_strength':0.0,
+                      'fundamentals_completeness':0.0,'fundamentals_requested':False,
+                      'info_status':'skipped','income_status':'skipped','info_error':'Skipped for speed: not in top technical candidates',
+                      'income_error':'Skipped for speed: not in top technical candidates','financial_last_date':None,
+                      'info_most_recent_date':None,'fundamentals_retrieved_at_utc':None})
         eligible,reason=peer_eligibility(r)
-        r['peer_eligible']=eligible
-        r['peer_eligibility_reason']=reason
+        r['peer_eligible']=eligible; r['peer_eligibility_reason']=reason
+
     successful_fund=[r for r in raw if r.get('fundamentals_ok')]
-    eligible_peers=[r for r in raw if r.get('peer_eligible')]
-    tech_rows=[r for r in raw if 'technical_score' in r];df=pd.DataFrame(tech_rows)
+    eligible_peers=[r for r in successful_fund if r.get('peer_eligible')]
     peer_cols=['symbol','sector_class','sector','industry','pe','pb','ev_ebitda','ebitda','net_debt','shares_outstanding','trailing_eps','book_value_per_share','price','currency_consistent','quote_currency','financial_currency','peer_eligible','peer_eligibility_reason']
-    peer_universe=pd.DataFrame(eligible_peers)[peer_cols].drop_duplicates('symbol') if eligible_peers else pd.DataFrame(columns=peer_cols)
-    coverage={'universe_size':len(symbols),'price_coverage':sum(bool(r.get('history_ok')) for r in raw),'fundamentals_coverage':len(successful_fund),'fundamentals_attempted':len(raw),'technical_coverage':len(tech_rows),'peer_eligible_coverage':len(eligible_peers),'peer_universe_size':len(peer_universe),'fundamentals_quality_avg':round(float(np.mean([r.get('fundamentals_quality',0) for r in successful_fund])) if successful_fund else 0,1),'fundamentals_strength_avg':round(float(np.mean([r.get('fundamentals_strength',0) for r in successful_fund])) if successful_fund else 0,1),'egx_calendar':EGX_CALENDAR_SOURCE,'egx_calendar_version':EGX_CALENDAR_VERSION,'egx_calendar_updated_utc':datetime.now(timezone.utc).isoformat(),'scan_started_utc':started.isoformat(),'backend':('curl_cffi' if CURL_CFFI_AVAILABLE else 'requests'),'python_version':platform.python_version(),'pandas_version':pd.__version__,'yfinance_version':getattr(yf,'__version__','unknown')}
+    peer_universe=pd.DataFrame(eligible_peers)[[c for c in peer_cols if c in pd.DataFrame(eligible_peers).columns]].drop_duplicates('symbol') if eligible_peers else pd.DataFrame(columns=peer_cols)
+    df=pd.DataFrame(tech_rows)
+    coverage={'universe_size':len(symbols),'batch_history_ok':True,'batch_mode':True,
+        'price_coverage':sum(bool(r.get('history_ok')) for r in raw),
+        'fundamentals_coverage':len(successful_fund),'fundamentals_attempted':len(fund_symbols),
+        'fundamentals_skipped':max(0,len(symbols)-len(fund_symbols)),
+        'technical_coverage':len(tech_rows),'fundamentals_top_n':len(fund_symbols),'history_years':int(years),
+        'top_technical_symbols':fund_symbols,'peer_eligible_coverage':len(eligible_peers),
+        'peer_universe_size':len(peer_universe),'fundamentals_quality_avg':round(float(np.mean([r.get('fundamentals_quality',0) for r in successful_fund])) if successful_fund else 0,1),
+        'fundamentals_strength_avg':round(float(np.mean([r.get('fundamentals_strength',0) for r in successful_fund])) if successful_fund else 0,1),
+        'egx_calendar':EGX_CALENDAR_SOURCE,'egx_calendar_version':EGX_CALENDAR_VERSION,
+        'scan_started_utc':started.isoformat(),'backend':('curl_cffi' if CURL_CFFI_AVAILABLE else 'requests'),
+        'python_version':platform.python_version(),'pandas_version':pd.__version__,'yfinance_version':getattr(yf,'__version__','unknown')}
     gate=getattr(client,'gate',None)
     if gate is not None:
-        coverage.update({'transport_attempts':gate.transport_attempts,'data_requests':gate.data_requests,'cookie_requests':gate.cookie_requests,'crumb_requests':gate.crumb_requests,'cookie_responses':gate.cookie_responses,'crumb_responses':gate.crumb_responses,'http_retries':gate.retry_count,'http_429':gate.rate_limit_count,'http_last_cooldown_seconds':gate.last_cooldown_seconds,'yfinance_internal_cookie_crumb_retry_possible':gate.yfinance_internal_retry_possible})
+        coverage.update({'transport_attempts':gate.transport_attempts,'data_requests':gate.data_requests,'cookie_requests':gate.cookie_requests,'crumb_requests':gate.crumb_requests,
+            'http_retries':gate.retry_count,'http_429':gate.rate_limit_count,'http_last_cooldown_seconds':gate.last_cooldown_seconds})
     if df.empty:
-        coverage['scan_finished_utc']=datetime.now(timezone.utc).isoformat(); coverage['history_calendar_holidays_loaded']=len(EGX_HOLIDAYS); return pd.DataFrame(),errors,coverage
-    fv=[fair_value(r,peer_universe) for _,r in df.iterrows()];fv_df=pd.DataFrame(fv,index=df.index,columns=['fair_value','fair_method','peer_count','mos','valuation_metrics_used','valuation_confidence'])
-    df=fv_df.join(df)
-
-    df['peer_universe_size']=len(peer_universe)
+        coverage['scan_finished_utc']=datetime.now(timezone.utc).isoformat(); return df,errors,coverage
+    fv=[fair_value(r,peer_universe) for _,r in df.iterrows()]
+    fv_df=pd.DataFrame(fv,index=df.index,columns=['fair_value','fair_method','peer_count','mos','valuation_metrics_used','valuation_confidence'])
+    df=fv_df.join(df); df['peer_universe_size']=len(peer_universe)
     df['fundamentals_freshness_score']=df['financial_last_date'].apply(lambda x:freshness_score(x,good_days=45,stale_days=365))
     df['price_freshness_score']=df['price_last_date'].apply(freshness_score)
     df['data_quality']=df.apply(lambda r:quality(pd.DataFrame(),r.to_dict(),pd.notna(r.fair_value),int(r.peer_count),r.price_last_date,r.history_quality),axis=1)
-    df['valuation_quality']=df.apply(lambda r: round(float(np.clip((25*min(1,int(r.valuation_metrics_used)/3)+25*min(1,int(r.peer_count)/5)+25*(1 if pd.notna(r.fair_value) else 0)+25*(1 if r.valuation_confidence=='High' else .6 if r.valuation_confidence=='Medium' else .25)),0,100)),1),axis=1)
+    df['valuation_quality']=df.apply(lambda r:round(float(np.clip((25*min(1,int(r.valuation_metrics_used)/3)+25*min(1,int(r.peer_count)/5)+25*(1 if pd.notna(r.fair_value) else 0)+25*(1 if r.valuation_confidence=='High' else .6 if r.valuation_confidence=='Medium' else .25)),0,100)),1),axis=1)
+    # Keep the full technical universe; investment score is only fully enriched for top-N.
     df['investment_score']=df.apply(inv_score,axis=1)
     df['confidence']=df.apply(lambda r:'High' if r.data_quality>=85 and pd.notna(r.fair_value) and r.peer_count>=3 and r.fundamentals_quality>=70 and r.valuation_metrics_used>=2 and r.valuation_confidence=='High' else ('Medium' if r.data_quality>=65 and r.fundamentals_quality>=50 and (pd.isna(r.fair_value) or r.valuation_metrics_used>=1) else 'Low'),axis=1)
     weights={'price_cagr':.15,'total_return_cagr':.35,'revenue_cagr':.20,'eps_cagr':.30}
     def wc(row):
-        a=[(float(row[k]),w) for k,w in weights.items() if pd.notna(row[k])]
+        a=[(float(row[k]),w) for k,w in weights.items() if pd.notna(row.get(k))]
         return np.nan if len(a)<3 else float(np.average([v for v,_ in a],weights=[w for _,w in a]))
     df['blended_historical_cagr']=df.apply(wc,axis=1)
     coverage['scan_finished_utc']=datetime.now(timezone.utc).isoformat(); coverage['history_calendar_holidays_loaded']=len(EGX_HOLIDAYS)
     return df.sort_values(['investment_score','technical_score'],ascending=False,na_position='last'),errors,coverage
-
 
 def live_yahoo_smoke_test(symbol='COMI'):
     """Real opt-in Yahoo integration gate.
@@ -812,16 +948,17 @@ def live_yahoo_smoke_test(symbol='COMI'):
             'yfinance_calls_serialized':True,'curl_retry_disabled':True,'yfinance_retry_disabled':True}
 
 @st.cache_data(ttl=1800)
-def scan(capital,risk,workers):
-    manager=YahooHTTPManager()
-    return scan_core(manager,capital,risk,workers,SYMBOLS)
+def scan(capital,risk,workers,fundamentals_limit,years):
+    manager=YahooHTTPManager(interval=0.25,retries=1,timeout=15)
+    return scan_core(manager,capital,risk,workers,SYMBOLS,fundamentals_limit,years)
 
+VERSION = 'V24.0 FAST DATA/PRODUCTION'
 st.set_page_config(page_title=f'EGX Analyzer {VERSION}',layout='wide');st.title(f'📈 EGX Smart Investment & Entry Analyzer {VERSION}')
 with st.sidebar:
-    capital=st.number_input('رأس المال بالجنيه',0.0,10_000_000.0,100_000.0,5000.0);risk=st.number_input('مخاطرة الصفقة %',.1,5.0,1.0,.1);workers=st.slider('اتصالات متوازية',1,4,2);go=st.button('🔄 فحص السوق',type='primary')
+    capital=st.number_input('رأس المال بالجنيه',0.0,10_000_000.0,100_000.0,5000.0);risk=st.number_input('مخاطرة الصفقة %',.1,5.0,1.0,.1);workers=st.slider('اتصالات متوازية',1,6,4);fundamentals_limit=st.slider('عدد الأسهم للفحص المالي العميق',5,30,10);years=st.selectbox('عدد سنين الفحص التاريخي',[2,3,5,10],index=2,help='الفحص الفني الشهري الكامل يحتاج سنتين على الأقل للحصول على 24 شهرًا تقريبًا.');go=st.button('🔄 فحص السوق',type='primary')
 if go:
-    with st.spinner('جاري الفحص...'):df,errors,cov=scan(capital,risk,workers)
-    st.subheader('📡 تغطية البيانات');st.json(cov)
+    with st.spinner('جاري الفحص...'):df,errors,cov=scan(capital,risk,workers,fundamentals_limit,years)
+    st.subheader('📡 تغطية البيانات');st.caption(f'📅 فترة الفحص التاريخي: {years} سنوات');st.json(cov)
     smoke=live_yahoo_smoke_test();
     if smoke.get('enabled'): st.write('Live Yahoo Smoke Test',smoke)
     if df.empty:st.error('لم يتم الحصول على بيانات فنية كافية من Yahoo Finance.')
